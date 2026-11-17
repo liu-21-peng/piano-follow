@@ -345,6 +345,8 @@ final class AppModel: ObservableObject {
 
     private var demoTimer: Timer?
     private var demoTime: Double = 0
+    /// 演示用真实起跑时刻：声音按真实时间推进，不再用"每次 +0.02"累加（累加会越播越慢、一卡一顿）
+    private var demoStart: Date?
 
     init() {
         fingering = Fingering.map(for: groups)
@@ -778,8 +780,9 @@ final class AppModel: ObservableObject {
         reset()
         running = true
         demoTime = 0
+        demoStart = Date()
         demoTimer?.invalidate()
-        demoTimer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { [weak self] _ in
+        demoTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             self?.demoTick()
         }
         log("演示开始（80 BPM 完美演奏）")
@@ -788,24 +791,36 @@ final class AppModel: ObservableObject {
     func stopDemo() {
         demoTimer?.invalidate()
         demoTimer = nil
+        demoStart = nil
         running = false
     }
 
     private func demoTick() {
-        guard running else { return }
-        demoTime += 0.02
-        guard pos < groups.count else {
+        guard running, let start = demoStart else { return }
+        let elapsed = Date().timeIntervalSince(start)
+        demoTime = elapsed
+        var played = 0
+        // 演示自己按时间往下走，不受"练习/自由"模式影响，也不会在同一个音上反复重播
+        while pos < groups.count && played < 6 {
+            let group = groups[pos]
+            let beat = Double(group.measure) * Geo.beatsPerBar + group.beatIn
+            let due = beat * 0.75
+            if elapsed < due { break }
+            if soundOn { group.midis.forEach { tone.play($0) } }
+            for i in groups[pos].cells.indices { groups[pos].cells[i].state = .hit }
+            groups[pos].state = .hit
+            hit += 1
+            stats.hit += 1
+            pos += 1
+            played += 1
+        }
+        if pos >= groups.count {
             stopDemo()
+            syncCursor()
             log("全曲完成 命中 \(hit) 组")
             return
         }
-        let group = groups[pos]
-        let beat = Double(group.measure) * Geo.beatsPerBar + group.beatIn
-        let due = beat * 0.75
-        if demoTime >= due {
-            if soundOn { group.midis.forEach { tone.play($0) } }
-            group.midis.forEach { feed($0) }
-        }
+        syncCursor()
     }
 
     // MARK: - 文本
@@ -970,6 +985,8 @@ final class TonePlayer {
     private var engine: AVAudioEngine?
     private var nodes: [AVAudioPlayerNode] = []
     private var index = 0
+    /// 已合成好的波形缓存：同一个音只算一次，避免演奏时在主线程反复做几十万次正弦运算（卡顿=声音一段一段的根因）
+    private var cache: [Int: AVAudioPCMBuffer] = [:]
     private lazy var format: AVAudioFormat? = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)
 
     func prepare() {
@@ -982,7 +999,7 @@ final class TonePlayer {
 
         guard let fmt = format else { return }
 
-        for _ in 0..<8 {
+        for _ in 0..<12 {
             let node = AVAudioPlayerNode()
             audioEngine.attach(node)
             audioEngine.connect(node, to: audioEngine.mainMixerNode, format: fmt)
@@ -998,9 +1015,19 @@ final class TonePlayer {
         engine = audioEngine
     }
 
-    func play(_ midi: Int, duration: Double = 0.9) {
+    func play(_ midi: Int, duration: Double = 0.55) {
         prepare()
-        guard engine != nil, let buffer = makeBuffer(midi: midi, duration: duration) else { return }
+        guard engine != nil else { return }
+        let key = midi * 1000 + Int((duration * 100).rounded())
+        let buffer: AVAudioPCMBuffer
+        if let hit = cache[key] {
+            buffer = hit
+        } else if let made = makeBuffer(midi: midi, duration: duration) {
+            cache[key] = made
+            buffer = made
+        } else {
+            return
+        }
         let node = nodes[index]
         index = (index + 1) % nodes.count
         node.scheduleBuffer(buffer, at: nil, options: [], completionHandler: nil)
@@ -1048,24 +1075,28 @@ final class TonePlayer {
         // 标准音高：A4（MIDI 69）= 440 Hz（旧版误写 220，导致整体低一个八度）
         let f0 = 440.0 * pow(2.0, Double(midi - 69) / 12.0)
         let total = Int(frames)
-        // 谐波叠加：越高的泛音越弱，接近琴弦振动
-        let amps: [Double] = [1.0, 0.60, 0.40, 0.26, 0.17, 0.11, 0.07, 0.05]
+        // 谐波叠加：高次泛音快速衰减，接近钢琴弦振动
+        let amps: [Double] = [1.00, 0.52, 0.31, 0.18, 0.10, 0.06, 0.03]
         let nyquistLimit = sampleRate * 0.45
+        // 尾部淡出：波形若被硬切断，听感就是"一段一段、断断续续"
+        let tail = max(0.06, length * 0.25)
 
         for i in 0..<total {
             let t = Double(i) / sampleRate
-            let attack = min(1.0, t / 0.008)
-            let decay = exp(-t * (1.7 / length))
+            let attack = min(1.0, t / 0.006)
+            let decay = exp(-t * (1.9 / length))
             var sum = 0.0
             for (h, a) in amps.enumerated() {
-                let f = f0 * Double(h + 1)
+                // 钢琴弦的轻微非谐性：高次泛音比整数倍略高
+                let f = f0 * (Double(h + 1) + 0.0022 * Double(h) * Double(h + 1))
                 if f >= nyquistLimit { break }
                 sum += sin(2.0 * .pi * f * t) * a
             }
             // 前 20ms 琴键锤击瞬态
-            let hammer = exp(-t * 120.0) * sin(2.0 * .pi * f0 * 2.0 * t) * 0.30
-            let mix = (sum / 2.3) + hammer
-            channel[i] = Float(mix * attack * decay * 0.62)
+            let hammer = exp(-t * 140.0) * sin(2.0 * .pi * f0 * 2.0 * t) * 0.16
+            let fadeOut = t > (length - tail) ? max(0.0, (length - t) / tail) : 1.0
+            let mix = (sum / 2.5) + hammer
+            channel[i] = Float(mix * attack * decay * fadeOut * 0.62)
         }
         return buffer
     }
@@ -2028,10 +2059,16 @@ struct JianpuCanvas: View {
     }
 
     private func draw(context: inout GraphicsContext) {
-        for group in groups {
-            let x = Geo.noteX(group.beatIn, measure: group.measure)
+        guard !groups.isEmpty else { return }
+        // 先算出每个组的横坐标；"到相邻组的最近间距"决定这一列能占多宽
+        let xs: [CGFloat] = groups.map { Geo.noteX($0.beatIn, measure: $0.measure) }
+        for (i, group) in groups.enumerated() {
+            let x = xs[i]
+            var gap: CGFloat = 46
+            if i > 0 { gap = min(gap, x - xs[i - 1]) }
+            if i + 1 < xs.count { gap = min(gap, xs[i + 1] - x) }
+            let slot = max(14, gap - 2)
             for cell in group.cells {
-                let text = labels(cell.midis)
                 let color: Color
                 switch cell.state {
                 case .hit: color = doneColor
@@ -2040,13 +2077,31 @@ struct JianpuCanvas: View {
                 case .idle: color = cell.staff == "rh" ? rhColor : lhColor
                 }
                 let strong = group.id == currentGroup
-                let y: CGFloat = cell.staff == "rh" ? 26 : 78
-                context.draw(
+                let base: CGFloat = strong ? 20 : 18
+                // 一个音位只标一个短标签：超过 4 个字符就截断，避免和弦串把整行糊住
+                var text = labels(cell.midis)
+                if text.count > 4 { text = String(text.prefix(3)) + "…" }
+                let weight: Font.Weight = strong ? .semibold : .regular
+                var resolved = context.resolve(
                     Text(text)
-                        .font(.system(size: strong ? 20 : 18, weight: strong ? .semibold : .regular, design: .serif))
-                        .foregroundColor(color),
-                    at: CGPoint(x: x, y: y)
+                        .font(.system(size: base, weight: weight, design: .serif))
+                        .foregroundColor(color)
                 )
+                let m = resolved.measure(in: CGSize(width: 400, height: 60))
+                if m.width > slot {
+                    // 按比例缩到正好塞进这一列；最小 9pt，仍然放不下就只留首字符
+                    let fit = max(9, base * (slot / max(1, m.width)))
+                    var short = text
+                    if fit < 11 && short.count > 2 { short = String(short.prefix(2)) }
+                    resolved = context.resolve(
+                        Text(short)
+                            .font(.system(size: fit, weight: weight, design: .serif))
+                            .foregroundColor(color)
+                    )
+                }
+                let y: CGFloat = cell.staff == "rh" ? 28 : 82
+                // 左对齐：从这一拍的位置向右排，绝不压到前一个音位
+                context.draw(resolved, at: CGPoint(x: x, y: y), anchor: .leading)
             }
         }
     }
