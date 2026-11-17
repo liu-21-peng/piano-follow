@@ -42,6 +42,11 @@ struct RawMeasure {
     var lh: [RawNote]
 }
 
+enum PracticeMode: String, CaseIterable {
+    case practice = "练习"
+    case free = "自由"
+}
+
 enum CellState: String {
     case idle, hit, wrong, miss
 }
@@ -303,8 +308,10 @@ import Combine
 
 final class AppModel: ObservableObject {
     // 曲谱
-    let measures: [RawMeasure] = PieceData.builtin
+    @Published var measures: [RawMeasure] = PieceData.builtin
     @Published var groups: [Group] = PieceData.buildGroups(PieceData.builtin)
+    @Published var pieceTitle: String = "练习曲 No.1 · C 大调双手交替 · 12 小节 · 80 BPM"
+    @Published var mode: PracticeMode = .practice
 
     // 跟随位置与统计
     @Published var pos: Int = 0
@@ -369,15 +376,31 @@ final class AppModel: ObservableObject {
     // MARK: - 判音引擎
 
     func feed(_ note: Int) {
-        trackEvent(note)
         guard !groups.isEmpty, pos < groups.count else { return }
+
+        // 只有自由模式才做「和弦事件指纹」定位；练习模式严格跟随，不跳篇
+        if mode == .free { trackEvent(note) }
 
         if match(at: pos, note: note) {
             afterHit()
             return
         }
 
-        // 向前 1~3 拍找：中间这些拍判为漏音
+        if mode == .practice {
+            // 练习模式：原地等待，只记错，不前进也不回退
+            wrong += 1
+            stats.error += 1
+            stats.wrong += 1
+            wrongFlash = note
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self = self else { return }
+                if self.wrongFlash == note { self.wrongFlash = nil }
+            }
+            log("错音 \(nameOf(note)) · 请弹 \(pendingHint())")
+            return
+        }
+
+        // 自由模式：向前 1~3 拍找，中间这些拍判为漏音
         for step in 1...3 where pos + step < groups.count {
             if canMatch(at: pos + step, note: note) {
                 for k in 0..<step { markMiss(pos + k) }
@@ -389,7 +412,7 @@ final class AppModel: ObservableObject {
             }
         }
 
-        // 向后 1~4 拍找：判为回退重练
+        // 自由模式：向后 1~4 拍找，判为回退重练
         for step in 1...4 {
             let target = pos - step
             if target >= 0 && canMatch(at: target, note: note) {
@@ -410,6 +433,48 @@ final class AppModel: ObservableObject {
             if self.wrongFlash == note { self.wrongFlash = nil }
         }
         log("错音 \(nameOf(note))")
+    }
+
+    /// 练习模式提示：当前这一组还差哪些音没弹
+    func pendingHint() -> String {
+        guard let g = groups[safe: pos] else { return "—" }
+        var names: [String] = []
+        for cell in g.cells where !cell.done {
+            for m in cell.midis where !cell.hitMidis.contains(m) {
+                names.append(nameOf(m))
+            }
+        }
+        return names.isEmpty ? "—" : names.joined(separator: " ")
+    }
+
+    /// 底栏引擎状态：练习模式直接显示这一组还差哪些音
+    var engineStatusText: String {
+        if running { return "演示中" }
+        if mode == .practice { return "练习 · 待弹 " + pendingHint() }
+        return "自由 · 任意起弹"
+    }
+
+    /// 载入自定义曲谱（简谱导入用）
+    func loadPiece(_ newMeasures: [RawMeasure], title: String) {
+        guard !newMeasures.isEmpty else { return }
+        stopDemo()
+        measures = newMeasures
+        groups = PieceData.buildGroups(newMeasures)
+        pieceTitle = title.isEmpty
+            ? "自定义曲目 · \(newMeasures.count) 小节 · 4/4"
+            : title + " · \(newMeasures.count) 小节"
+        pos = 0
+        hit = 0
+        wrong = 0
+        miss = 0
+        stats.clear()
+        scoreAnchor = nil
+        wrongFlash = nil
+        eventList.removeAll()
+        curChord = []
+        fingering = Fingering.map(for: groups)
+        syncCursor()
+        log("已载入「\(pieceTitle)」· \(groups.count) 组")
     }
 
     private func afterHit() {
@@ -971,15 +1036,27 @@ final class TonePlayer {
         buffer.frameLength = frames
         guard let channel = buffer.floatChannelData?[0] else { return nil }
 
-        let frequency = 220.0 * pow(2.0, Double(midi - 69) / 12.0)
+        // 标准音高：A4（MIDI 69）= 440 Hz（旧版误写 220，导致整体低一个八度）
+        let f0 = 440.0 * pow(2.0, Double(midi - 69) / 12.0)
         let total = Int(frames)
+        // 谐波叠加：越高的泛音越弱，接近琴弦振动
+        let amps: [Double] = [1.0, 0.60, 0.40, 0.26, 0.17, 0.11, 0.07, 0.05]
+        let nyquistLimit = sampleRate * 0.45
 
         for i in 0..<total {
             let t = Double(i) / sampleRate
-            let attack = min(1.0, t / 0.012)
-            let decay = exp(-t * (2.4 / length))
-            let value = sin(2.0 * .pi * frequency * t) * attack * decay * 0.65
-            channel[i] = Float(value)
+            let attack = min(1.0, t / 0.008)
+            let decay = exp(-t * (1.7 / length))
+            var sum = 0.0
+            for (h, a) in amps.enumerated() {
+                let f = f0 * Double(h + 1)
+                if f >= nyquistLimit { break }
+                sum += sin(2.0 * .pi * f * t) * a
+            }
+            // 前 20ms 琴键锤击瞬态
+            let hammer = exp(-t * 120.0) * sin(2.0 * .pi * f0 * 2.0 * t) * 0.30
+            let mix = (sum / 2.3) + hammer
+            channel[i] = Float(mix * attack * decay * 0.62)
         }
         return buffer
     }
@@ -991,6 +1068,7 @@ final class TonePlayer {
 // ============================================================
 
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum AppColors {
     static let bg = Color(red: 0.055, green: 0.072, blue: 0.086)
@@ -1008,6 +1086,10 @@ struct ContentView: View {
     @State private var showJianpu = true
     @State private var showRoll = true
     @State private var showKB = true
+    @State private var showImport = false
+    @State private var importText = JianpuParser.demo
+    @State private var importErr = ""
+    @State private var showImportFile = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1024,19 +1106,32 @@ struct ContentView: View {
             statusBar
         }
         .background(AppColors.bg)
+        .sheet(isPresented: $showImport) { importSheet }
+        .fileImporter(isPresented: $showImportFile,
+                      allowedContentTypes: scoreFileTypes,
+                      allowsMultipleSelection: false) { result in
+            handleFile(result)
+        }
+    }
+
+    private var scoreFileTypes: [UTType] {
+        var list: [UTType] = [.midi, .xml]
+        if let m = UTType(filenameExtension: "musicxml") { list.append(m) }
+        return list
     }
 
     // MARK: - 顶栏
 
     private var headerBar: some View {
-        HStack(alignment: .center, spacing: 14) {
+        HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("钢琴跟弹 · 光标跟随")
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundColor(AppColors.text)
-                Text("练习曲 No.1 · C 大调双手交替 · 12 小节 · 80 BPM")
+                Text(model.pieceTitle)
                     .font(.system(size: 11))
                     .foregroundColor(AppColors.dim)
+                    .lineLimit(1)
             }
             Spacer()
             HStack(spacing: 6) {
@@ -1045,15 +1140,186 @@ struct ContentView: View {
                 viewToggle("卷帘", $showRoll)
                 viewToggle("键盘", $showKB)
             }
+            HStack(spacing: 5) {
+                modeToggle("练习", .practice)
+                modeToggle("自由", .free)
+            }
+            Button {
+                importErr = ""
+                showImport = true
+            } label: {
+                Text("导入简谱")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(AppColors.brass)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(RoundedRectangle(cornerRadius: 5).fill(AppColors.brass.opacity(0.14)))
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(AppColors.brass.opacity(0.45), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
             HStack(spacing: 8) {
                 chip(model.midiStatus, on: model.midi.connectedCount > 0)
-                chip(model.running ? "演示中" : "等待演奏", on: model.running)
+                chip(model.mode == .practice ? "练习" : "自由", on: true)
                 chip(model.soundOn ? "声音开" : "声音关", on: model.soundOn)
             }
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 16)
         .frame(height: 56)
         .background(AppColors.panel)
+    }
+
+    private func modeToggle(_ title: String, _ m: PracticeMode) -> some View {
+        let on = model.mode == m
+        return Button {
+            model.mode = m
+            model.log(m == .practice
+                ? "练习模式：弹对才前进，弹错原地等待，不会跳篇"
+                : "自由模式：任意位置弹对即自动跳转")
+        } label: {
+            Text(title)
+                .font(.system(size: 11, weight: on ? Font.Weight.medium : Font.Weight.regular))
+                .foregroundColor(on ? AppColors.brass : AppColors.dim)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(on ? AppColors.brass.opacity(0.14) : Color.white.opacity(0.03))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5)
+                        .stroke(on ? AppColors.brass.opacity(0.45) : Color.white.opacity(0.08), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - 导入简谱
+
+    private var importSheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("导入简谱")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(AppColors.text)
+                Spacer()
+                Button("载入示例") { importText = JianpuParser.demo }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12))
+                    .foregroundColor(AppColors.brass)
+                Button("取消") { showImport = false }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12))
+                    .foregroundColor(AppColors.dim)
+            }
+            Text("第一行可写「标题: 曲名」。之后每行以「右手:」或「左手:」开头，用 | 分小节，每小节必须满 4 拍。数字 1–7 为音级（1=C），, 降八度，' 升八度，- 延一拍，/ 半拍，[1 3 5] 和弦，0 休止。")
+                .font(.system(size: 11))
+                .foregroundColor(AppColors.dim)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                showImport = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                    showImportFile = true
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Text("从文件导入五线谱")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(AppColors.brass)
+                    Text("MIDI / MusicXML")
+                        .font(.system(size: 10))
+                        .foregroundColor(AppColors.dim)
+                    Spacer()
+                    Text("选择文件")
+                        .font(.system(size: 11))
+                        .foregroundColor(AppColors.dim)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(RoundedRectangle(cornerRadius: 7).fill(AppColors.brass.opacity(0.12)))
+                .overlay(RoundedRectangle(cornerRadius: 7).stroke(AppColors.brass.opacity(0.4), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            TextEditor(text: $importText)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundColor(AppColors.text)
+                .scrollContentBackground(.hidden)
+                .frame(minHeight: 240)
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.1), lineWidth: 1))
+            if !importErr.isEmpty {
+                Text(importErr)
+                    .font(.system(size: 11))
+                    .foregroundColor(Color(red: 0.78, green: 0.36, blue: 0.27))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button {
+                    doImport()
+                } label: {
+                    Text("解析并载入")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 7).fill(AppColors.brass))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(24)
+        .frame(minWidth: 560, minHeight: 420)
+        .background(AppColors.bg)
+    }
+
+    private func doImport() {
+        do {
+            let r = try JianpuParser.parse(importText)
+            model.loadPiece(r.measures, title: r.title)
+            importErr = ""
+            showImport = false
+        } catch {
+            importErr = error.localizedDescription
+        }
+    }
+
+    private func handleFile(_ result: Result<[URL], Error>) {
+        switch result {
+        case .failure(let err):
+            let msg = err.localizedDescription
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                importErr = msg
+                showImport = true
+            }
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let data = try Data(contentsOf: url)
+                let name = url.deletingPathExtension().lastPathComponent
+                let ext = url.pathExtension.lowercased()
+                let parsed: (title: String, measures: [RawMeasure])
+                if ext == "mid" || ext == "midi" {
+                    parsed = try MidiParser.parse(data, title: name)
+                } else {
+                    guard let text = String(data: data, encoding: .utf8) else {
+                        throw ScoreFileError.message("文件读不出文本，可能不是 UTF-8 的 MusicXML")
+                    }
+                    parsed = try MusicXmlParser.parse(text, fallbackTitle: name)
+                }
+                model.loadPiece(parsed.measures, title: parsed.title)
+                importErr = ""
+                showImport = false
+            } catch {
+                let msg = error.localizedDescription
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    importErr = msg
+                    showImport = true
+                }
+            }
+        }
     }
 
     private func chip(_ text: String, on: Bool) -> some View {
@@ -1476,7 +1742,7 @@ struct ContentView: View {
             stat("错音", "\(model.wrong)")
             stat("漏音", "\(model.miss)")
             stat("准确率", model.stats.accuracyText)
-            stat("引擎状态", model.running ? "演示中" : "等待演奏")
+            stat("引擎状态", model.engineStatusText)
             Spacer()
             Text("共 \(model.groups.count) 组")
                 .font(.system(size: 11))
@@ -1929,5 +2195,462 @@ struct KeyboardView: View {
         let ws = self.whites
         guard idx >= 0 && idx < ws.count else { return nil }
         return ws[idx]
+    }
+}
+
+// ============================================================
+//  简谱文本解析：与网页版同一套格式
+// ============================================================
+
+enum JianpuParser {
+    static let demo = """
+    标题: 小星星（C 大调）
+    右手: 1 1 5 5 | 6 6 5 - | 4 4 3 3 | 2 2 1 -
+    右手: 5 5 4 4 | 3 3 2 - | 5 5 4 4 | 3 3 2 -
+    左手: 1, - 5, - | 1, - 5, - | 4, - 1, - | 5, - 1, -
+    左手: 1, - 5, - | 1, - 5, - | 4, - 1, - | 5, - 1, -
+    """
+
+    enum ParseError: LocalizedError {
+        case message(String)
+        var errorDescription: String? {
+            switch self {
+            case .message(let m): return m
+            }
+        }
+    }
+
+    private static let deg = [0, 0, 2, 4, 5, 7, 9, 11]
+
+    static func parse(_ text: String) throws -> (title: String, measures: [RawMeasure]) {
+        var rhBars: [[RawNote]] = []
+        var lhBars: [[RawNote]] = []
+        var cur = "rh"
+        var title = ""
+
+        let rows = text.components(separatedBy: CharacterSet.newlines)
+        for row in rows {
+            let line = row.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+
+            if let m = firstMatch(line, "^(标题|title)\\s*[:：]\\s*(.+)$", [.caseInsensitive]) {
+                title = m[2].trimmingCharacters(in: .whitespaces)
+                continue
+            }
+
+            var body = line
+            if let m = firstMatch(line, "^(右手|左手|RH|LH|R|L)\\s*[:：]?\\s*(.*)$", [.caseInsensitive]) {
+                let head = m[1]
+                cur = (head.hasPrefix("左") || head.uppercased().hasPrefix("L")) ? "lh" : "rh"
+                body = m[2]
+            }
+
+            let sections = body.components(separatedBy: CharacterSet(charactersIn: "|｜"))
+            for sec in sections {
+                let seg = sec.trimmingCharacters(in: .whitespaces)
+                if seg.isEmpty { continue }
+                let barNo = (cur == "rh" ? rhBars.count : lhBars.count) + 1
+                let toks = findAll(seg, "[#b]?[0-7][',]*/?|-|\\[[^\\]]*\\]")
+                if toks.isEmpty { continue }
+
+                var notes: [RawNote] = []
+                var beat = 0.0
+                for tk in toks {
+                    if tk == "-" {
+                        if notes.isEmpty {
+                            throw ParseError.message("第 \(barNo) 小节开头就是延音线「-」")
+                        }
+                        notes[notes.count - 1].dur += 1
+                        beat += 1
+                        continue
+                    }
+                    let half = tk.hasSuffix("/")
+                    let core = half ? String(tk.dropLast()) : tk
+                    var midis: [Int] = []
+                    if core.hasPrefix("[") {
+                        let inner = core
+                            .replacingOccurrences(of: "[", with: "")
+                            .replacingOccurrences(of: "]", with: "")
+                        let parts = inner.components(separatedBy: CharacterSet(charactersIn: ",， "))
+                        for part in parts where !part.isEmpty {
+                            if let v = try midiOf(part) { midis.append(v) }
+                        }
+                        if midis.isEmpty {
+                            throw ParseError.message("第 \(barNo) 小节的和弦是空的")
+                        }
+                    } else {
+                        if let v = try midiOf(core) { midis = [v] }
+                    }
+                    if beat > 4.0001 {
+                        throw ParseError.message("第 \(barNo) 小节超过 4 拍")
+                    }
+                    let len: Double = half ? 0.5 : 1
+                    if !midis.isEmpty {
+                        notes.append(RawNote(beat: beat, midis: midis, dur: len))
+                    }
+                    beat += len
+                }
+                if abs(beat - 4) > 0.0001 {
+                    throw ParseError.message("第 \(barNo) 小节只写了 \(beat) 拍，必须满 4 拍")
+                }
+                if cur == "rh" { rhBars.append(notes) } else { lhBars.append(notes) }
+            }
+        }
+
+        if rhBars.isEmpty {
+            throw ParseError.message("没找到音符，请确认写了「右手:」并填入数字")
+        }
+        if !lhBars.isEmpty && lhBars.count != rhBars.count {
+            throw ParseError.message("左手 \(lhBars.count) 小节、右手 \(rhBars.count) 小节，数量必须一致")
+        }
+        if rhBars.count > 64 {
+            throw ParseError.message("小节太多（\(rhBars.count) 个），请分批导入")
+        }
+
+        var out: [RawMeasure] = []
+        for i in 0..<rhBars.count {
+            let lh: [RawNote] = i < lhBars.count ? lhBars[i] : []
+            out.append(RawMeasure(chord: "", rh: rhBars[i], lh: lh))
+        }
+        return (title, out)
+    }
+
+    private static func midiOf(_ token: String) throws -> Int? {
+        var acc = 0
+        var i = token.startIndex
+        if token.hasPrefix("#") { acc = 1; i = token.index(after: i) }
+        else if token.hasPrefix("b") { acc = -1; i = token.index(after: i) }
+        guard i < token.endIndex, let d = Int(String(token[i])) else {
+            throw ParseError.message("看不懂的音符「\(token)」")
+        }
+        if d == 0 { return nil }
+        var midi = 60 + deg[d] + acc
+        var j = token.index(after: i)
+        while j < token.endIndex {
+            let ch = token[j]
+            if ch == "'" { midi += 12 }
+            else if ch == "," { midi -= 12 }
+            else if ch == "/" { }
+            else { throw ParseError.message("看不懂的音符「\(token)」") }
+            j = token.index(after: j)
+        }
+        guard midi >= 21 && midi <= 108 else {
+            throw ParseError.message("音高超出范围：「\(token)」")
+        }
+        return midi
+    }
+
+    private static func firstMatch(_ source: String,
+                                  _ pattern: String,
+                                  _ options: NSRegularExpression.Options = []) -> [String]? {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: options) else { return nil }
+        let ns = source as NSString
+        guard let m = re.firstMatch(in: source, options: [], range: NSRange(location: 0, length: ns.length)) else { return nil }
+        var out: [String] = []
+        for i in 0..<m.numberOfRanges {
+            let r = m.range(at: i)
+            out.append(r.location == NSNotFound ? "" : ns.substring(with: r))
+        }
+        return out
+    }
+
+    private static func findAll(_ source: String, _ pattern: String) -> [String] {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: []) else { return [] }
+        let ns = source as NSString
+        return re.matches(in: source, options: [], range: NSRange(location: 0, length: ns.length))
+            .map { ns.substring(with: $0.range) }
+    }
+}
+
+// ============================================================
+//  五线谱文件导入：MIDI（.mid/.midi）与 MusicXML（.musicxml/.xml）
+// ============================================================
+
+enum ScoreFileError: LocalizedError {
+    case message(String)
+    var errorDescription: String? {
+        switch self {
+        case .message(let m): return m
+        }
+    }
+}
+
+enum MidiParser {
+    struct Ev {
+        let tick: Int
+        let midi: Int
+        let len: Int
+    }
+
+    static func parse(_ data: Data, title: String) throws -> (title: String, measures: [RawMeasure]) {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 14 else { throw ScoreFileError.message("文件太小，不像是 MIDI") }
+        guard bytes[0] == 0x4D, bytes[1] == 0x54, bytes[2] == 0x68, bytes[3] == 0x64 else {
+            throw ScoreFileError.message("不是 MIDI 文件（没有 MThd 文件头）")
+        }
+        let division = (Int(bytes[12]) << 8) | Int(bytes[13])
+        guard division > 0 else { throw ScoreFileError.message("MIDI 时间基准无效") }
+        let ppq = Double(division)
+        let barLength = 4.0
+
+        var pos = 14
+        var tracks: [[Ev]] = []
+        var metaTitle = ""
+
+        while pos + 8 <= bytes.count {
+            let isTrack = bytes[pos] == 0x4D && bytes[pos + 1] == 0x54 && bytes[pos + 2] == 0x72 && bytes[pos + 3] == 0x6B
+            if !isTrack { break }
+            let len = (Int(bytes[pos + 4]) << 24) | (Int(bytes[pos + 5]) << 16) | (Int(bytes[pos + 6]) << 8) | Int(bytes[pos + 7])
+            let end = min(pos + 8 + max(0, len), bytes.count)
+            var q = pos + 8
+            var tick = 0
+            var running: UInt8 = 0
+            var notes: [Ev] = []
+            var open: [Int: Int] = [:]
+
+            while q < end {
+                var delta = 0
+                var more = true
+                while more && q < end {
+                    let b = bytes[q]
+                    q += 1
+                    delta = (delta << 7) | Int(b & 0x7F)
+                    more = (b & 0x80) != 0
+                }
+                tick += delta
+                if q >= end { break }
+
+                var status = bytes[q]
+                if (status & 0x80) != 0 {
+                    q += 1
+                    if status < 0xF0 { running = status }
+                } else {
+                    status = running
+                }
+                if status == 0 { break }
+
+                let hi = status & 0xF0
+                if hi == 0x90 || hi == 0x80 {
+                    if q + 1 >= end { break }
+                    let note = Int(bytes[q] & 0x7F)
+                    let vel = Int(bytes[q + 1] & 0x7F)
+                    q += 2
+                    if hi == 0x90 && vel > 0 {
+                        if open[note] == nil { open[note] = tick }
+                    } else if let start = open.removeValue(forKey: note) {
+                        notes.append(Ev(tick: start, midi: note, len: max(1, tick - start)))
+                    }
+                } else if hi == 0xC0 || hi == 0xD0 {
+                    q += 1
+                } else if hi == 0xA0 || hi == 0xB0 || hi == 0xE0 {
+                    q += 2
+                } else if status == 0xFF {
+                    if q >= end { break }
+                    let type = bytes[q]
+                    q += 1
+                    var metaLen = 0
+                    var moreMeta = true
+                    while moreMeta && q < end {
+                        let b = bytes[q]
+                        q += 1
+                        metaLen = (metaLen << 7) | Int(b & 0x7F)
+                        moreMeta = (b & 0x80) != 0
+                    }
+                    let stop = min(q + metaLen, end)
+                    if type == 0x03 && q < stop {
+                        let raw = Array(bytes[q..<stop])
+                        if let t = String(bytes: raw, encoding: .utf8) { metaTitle = t }
+                    }
+                    q = stop
+                } else if status == 0xF0 || status == 0xF7 {
+                    var sysLen = 0
+                    var moreSys = true
+                    while moreSys && q < end {
+                        let b = bytes[q]
+                        q += 1
+                        sysLen = (sysLen << 7) | Int(b & 0x7F)
+                        moreSys = (b & 0x80) != 0
+                    }
+                    q = min(q + sysLen, end)
+                } else {
+                    break
+                }
+            }
+
+            for (note, start) in open {
+                notes.append(Ev(tick: start, midi: note, len: 1))
+            }
+            if !notes.isEmpty { tracks.append(notes) }
+            pos = end
+        }
+
+        guard !tracks.isEmpty else { throw ScoreFileError.message("MIDI 里没有找到音符") }
+
+        var rhList: [Ev] = []
+        var lhList: [Ev] = []
+        if tracks.count >= 2 {
+            let sumA = tracks[0].reduce(0) { $0 + $1.midi }
+            let sumB = tracks[1].reduce(0) { $0 + $1.midi }
+            if sumA >= sumB {
+                rhList = tracks[0]
+                lhList = tracks[1]
+            } else {
+                rhList = tracks[1]
+                lhList = tracks[0]
+            }
+        } else {
+            for e in tracks[0] {
+                if e.midi >= 60 { rhList.append(e) } else { lhList.append(e) }
+            }
+        }
+
+        func buildBars(_ list: [Ev], limit: Int) -> [[RawNote]] {
+            var map: [Int: [RawNote]] = [:]
+            for e in list {
+                let beat = Double(e.tick) / ppq
+                let bar = Int(floor(beat / barLength))
+                if bar < 0 || bar >= limit { continue }
+                let inBar = beat - Double(bar) * barLength
+                let dur = min(barLength, max(0.25, Double(e.len) / ppq))
+                map[bar, default: []].append(RawNote(beat: inBar, midis: [e.midi], dur: dur))
+            }
+            if map.isEmpty { return [] }
+            let top = map.keys.max() ?? 0
+            var out: [[RawNote]] = []
+            for i in 0...top {
+                out.append((map[i] ?? []).sorted { $0.beat < $1.beat })
+            }
+            return out
+        }
+
+        let rhBars = buildBars(rhList, limit: 64)
+        let lhBars = buildBars(lhList, limit: 64)
+        let count = max(rhBars.count, lhBars.count)
+        guard count > 0 else { throw ScoreFileError.message("按 4/4 切分后没有任何小节") }
+
+        var out: [RawMeasure] = []
+        for i in 0..<count {
+            let rh: [RawNote] = i < rhBars.count ? rhBars[i] : []
+            let lh: [RawNote] = i < lhBars.count ? lhBars[i] : []
+            out.append(RawMeasure(chord: "", rh: rh, lh: lh))
+        }
+
+        var finalTitle = metaTitle.isEmpty ? title : metaTitle
+        if count >= 64 { finalTitle += "（只取前 64 小节）" }
+        return (finalTitle, out)
+    }
+}
+
+enum MusicXmlParser {
+    private static let stepValue: [Character: Int] = ["C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11]
+
+    static func parse(_ text: String, fallbackTitle: String) throws -> (title: String, measures: [RawMeasure]) {
+        guard text.contains("<score-partwise") || text.contains("<score-timewise") else {
+            throw ScoreFileError.message("不是 MusicXML（缺少 score-partwise 根节点）")
+        }
+        let title = innerText(text, "work-title") ?? innerText(text, "movement-title") ?? fallbackTitle
+
+        var parts: [String] = []
+        var cursor = text.startIndex
+        while let a = text.range(of: "<part ", range: cursor..<text.endIndex),
+              let b = text.range(of: "</part>", range: a.upperBound..<text.endIndex) {
+            parts.append(String(text[a.lowerBound..<b.upperBound]))
+            cursor = b.upperBound
+        }
+        if parts.isEmpty,
+           let a = text.range(of: "<part>"),
+           let b = text.range(of: "</part>", range: a.upperBound..<text.endIndex) {
+            parts.append(String(text[a.lowerBound..<b.upperBound]))
+        }
+        guard !parts.isEmpty else { throw ScoreFileError.message("没有找到 <part> 乐谱内容") }
+
+        var rhBars: [[RawNote]] = []
+        var lhBars: [[RawNote]] = []
+        let splitByStaff = parts.count == 1
+
+        for (pi, part) in parts.enumerated() {
+            if !splitByStaff && pi > 1 { break }
+            var divisions = 1.0
+            var cur = part.startIndex
+            while let a = part.range(of: "<measure", range: cur..<part.endIndex),
+                  let b = part.range(of: "</measure>", range: a.upperBound..<part.endIndex) {
+                let body = String(part[a.upperBound..<b.lowerBound])
+                if let d = Double(innerText(body, "divisions") ?? ""), d > 0 { divisions = d }
+
+                var staffTime: [Int: Double] = [1: 0.0, 2: 0.0]
+                var lastPos: [Int: Double] = [:]
+                var notesHere: [Int: [RawNote]] = [1: [], 2: []]
+
+                var nc = body.startIndex
+                while let na = body.range(of: "<note", range: nc..<body.endIndex),
+                      let nb = body.range(of: "</note>", range: na.upperBound..<body.endIndex) {
+                    let nbBody = String(body[na.upperBound..<nb.lowerBound])
+                    nc = nb.upperBound
+
+                    let staff = Int(innerText(nbBody, "staff") ?? "1") ?? 1
+                    let isChord = nbBody.contains("<chord/>") || nbBody.contains("<chord />")
+                    let isRest = nbBody.contains("<rest")
+                    let rawDur = Double(innerText(nbBody, "duration") ?? "") ?? divisions
+                    var beats = rawDur / divisions
+                    if beats <= 0 { beats = 1.0 }
+
+                    var pos = staffTime[staff] ?? 0.0
+                    if isChord, let last = lastPos[staff] { pos = last }
+                    staffTime[staff] = pos + beats
+
+                    if !isRest,
+                       let step = innerText(nbBody, "step"),
+                       let octave = Int(innerText(nbBody, "octave") ?? "") {
+                        let alter = Int(innerText(nbBody, "alter") ?? "0") ?? 0
+                        if let firstChar = step.first, let base = stepValue[firstChar] {
+                            let midi = 12 * (octave + 1) + base + alter
+                            if midi >= 21 && midi <= 108 {
+                                let note = RawNote(beat: min(3.75, pos),
+                                                   midis: [midi],
+                                                   dur: min(4.0, max(0.25, beats)))
+                                notesHere[staff, default: []].append(note)
+                                if !isChord { lastPos[staff] = pos }
+                            }
+                        }
+                    }
+                }
+
+                if splitByStaff {
+                    rhBars.append((notesHere[1] ?? []).sorted { $0.beat < $1.beat })
+                    lhBars.append((notesHere[2] ?? []).sorted { $0.beat < $1.beat })
+                } else if pi == 0 {
+                    let merged = (notesHere[1] ?? []) + (notesHere[2] ?? [])
+                    rhBars.append(merged.sorted { $0.beat < $1.beat })
+                } else {
+                    let merged = (notesHere[1] ?? []) + (notesHere[2] ?? [])
+                    lhBars.append(merged.sorted { $0.beat < $1.beat })
+                }
+                cur = b.upperBound
+            }
+        }
+
+        let count = min(64, max(rhBars.count, lhBars.count))
+        guard count > 0 else { throw ScoreFileError.message("没有解析到音符，请确认导出的是含 <note> 的 MusicXML") }
+
+        var out: [RawMeasure] = []
+        for i in 0..<count {
+            let rh: [RawNote] = i < rhBars.count ? rhBars[i] : []
+            let lh: [RawNote] = i < lhBars.count ? lhBars[i] : []
+            out.append(RawMeasure(chord: "", rh: rh, lh: lh))
+        }
+        var finalTitle = title
+        if max(rhBars.count, lhBars.count) > 64 { finalTitle += "（只取前 64 小节）" }
+        return (finalTitle, out)
+    }
+
+    private static func innerText(_ source: String, _ tag: String) -> String? {
+        guard let a = source.range(of: "<" + tag),
+              let b = source.range(of: "</" + tag + ">", range: a.upperBound..<source.endIndex) else { return nil }
+        var inner = String(source[a.upperBound..<b.lowerBound])
+        if let gt = inner.firstIndex(of: ">") {
+            inner = String(inner[inner.index(after: gt)...])
+        }
+        let trimmed = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
