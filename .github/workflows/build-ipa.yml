@@ -1,0 +1,63 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 查看环境
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成 Xcode 工程
+        run: xcodegen generate --spec project.yml
+
+      - name: 编译打包（未签名 archive）
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project PianoFollow.xcodeproj \
+            -scheme PianoFollow \
+            -sdk iphoneos \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/PianoFollow.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee build.log
+
+      - name: 组装 ipa
+        run: |
+          mkdir -p build/Payload
+          cp -R build/PianoFollow.xcarchive/Products/Applications/PianoFollow.app build/Payload/
+          cd build && zip -qr PianoFollow.ipa Payload && ls -la PianoFollow.ipa
+
+      - name: 上传 ipa
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PianoFollow-ipa
+          path: build/PianoFollow.ipa
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 30
