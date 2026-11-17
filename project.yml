@@ -21,14 +21,14 @@ targets:
     type: application
     platform: iOS
     sources:
-      - path: Sources
+      - path: App.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.pianofollow.app
         PRODUCT_NAME: PianoFollow
         TARGETED_DEVICE_FAMILY: "2"
     info:
-      path: Sources/Info.plist
+      path: Info.plist
       properties:
         CFBundleDisplayName: 钢琴跟弹
         CFBundleShortVersionString: "1.0"
