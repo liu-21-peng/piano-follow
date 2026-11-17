@@ -43,6 +43,8 @@ targets:
         NSBluetoothAlwaysUsageDescription: 连接蓝牙 MIDI 电钢琴需要此权限
         NSBluetoothPeripheralUsageDescription: 连接蓝牙 MIDI 电钢琴需要此权限
         NSMicrophoneUsageDescription: 声学钢琴用麦克风拾音需要此权限
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
 
 schemes:
   PianoFollow:

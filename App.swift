@@ -135,9 +135,13 @@ enum Geo {
 
     static func measureX(_ m: Int) -> CGFloat { CGFloat(m) * measureW }
 
+    /// 每小节拍数（以四分音符为 1 拍）：4/4 = 4，3/4 = 3，6/8 = 3，2/4 = 2
+    static var beatsPerBar: Double = 4.0
+
     static func noteX(_ beat: Double, measure: Int) -> CGFloat {
         let usable = measureW - headerPad - rightPad
-        return measureX(measure) + headerPad + CGFloat(beat) * (usable / 4)
+        let bpb = beatsPerBar > 0 ? beatsPerBar : 4.0
+        return measureX(measure) + headerPad + CGFloat(beat) * (usable / CGFloat(bpb))
     }
 
     static func x(of group: Group) -> CGFloat { noteX(group.beatIn, measure: group.measure) }
@@ -219,7 +223,7 @@ enum Fingering {
         for staff in ["rh", "lh"] {
             var items: [(key: String, order: Double, midi: Int)] = []
             for g in groups {
-                let absBeat = Double(g.measure * 4) + g.beatIn
+                let absBeat = Double(g.measure) * Geo.beatsPerBar + g.beatIn
                 for c in g.cells where c.staff == staff {
                     let anchor = (staff == "rh") ? (c.midis.min() ?? 60) : (c.midis.max() ?? 48)
                     items.append((Geo.key(g.measure, staff, g.beatIn), absBeat, anchor))
@@ -454,15 +458,19 @@ final class AppModel: ObservableObject {
         return "自由 · 任意起弹"
     }
 
-    /// 载入自定义曲谱（简谱导入用）
-    func loadPiece(_ newMeasures: [RawMeasure], title: String) {
+    /// 载入自定义曲谱（简谱导入用）。meterNum / meterDen 为拍号分子分母，默认 4/4。
+    func loadPiece(_ newMeasures: [RawMeasure], title: String, meterNum: Int = 4, meterDen: Int = 4) {
         guard !newMeasures.isEmpty else { return }
         stopDemo()
+        let mn = (meterNum > 0 && meterNum <= 32) ? meterNum : 4
+        let md = (meterDen > 0 && meterDen <= 64) ? meterDen : 4
+        let meterText = "\(mn)/\(md)"
+        Geo.beatsPerBar = Double(mn) * 4.0 / Double(md)
         measures = newMeasures
         groups = PieceData.buildGroups(newMeasures)
         pieceTitle = title.isEmpty
-            ? "自定义曲目 · \(newMeasures.count) 小节 · 4/4"
-            : title + " · \(newMeasures.count) 小节"
+            ? "自定义曲目 · \(newMeasures.count) 小节 · \(meterText)"
+            : title + " · \(newMeasures.count) 小节 · \(meterText)"
         pos = 0
         hit = 0
         wrong = 0
@@ -496,7 +504,7 @@ final class AppModel: ObservableObject {
     private func gradeCurrentGroup() {
         guard pos < groups.count else { return }
         let g = groups[pos]
-        let absBeat = Double(g.measure * 4) + g.beatIn
+        let absBeat = Double(g.measure) * Geo.beatsPerBar + g.beatIn
         let now = Date()
         guard let anchor = scoreAnchor else {
             scoreAnchor = now.addingTimeInterval(-absBeat * Fingering.beatSeconds)
@@ -792,7 +800,7 @@ final class AppModel: ObservableObject {
             return
         }
         let group = groups[pos]
-        let beat = Double(group.measure * 4) + group.beatIn
+        let beat = Double(group.measure) * Geo.beatsPerBar + group.beatIn
         let due = beat * 0.75
         if demoTime >= due {
             if soundOn { group.midis.forEach { tone.play($0) } }
@@ -838,11 +846,12 @@ final class AppModel: ObservableObject {
     }
 
     var currentBeatText: String {
-        guard let group = groups[safe: pos] else { return "4/4" }
+        let perBar = Int(Geo.beatsPerBar > 0 ? Geo.beatsPerBar : 4)
+        guard let group = groups[safe: pos] else { return "1/\(perBar)" }
         let beat = group.beatIn
         let whole = Int(beat)
         let half = (beat - Double(whole)) > 0.2 ? " ½" : ""
-        return "\(whole + 1)\(half)/4"
+        return "\(whole + 1)\(half)/\(perBar)"
     }
 }
 
@@ -1300,7 +1309,7 @@ struct ContentView: View {
                 let data = try Data(contentsOf: url)
                 let name = url.deletingPathExtension().lastPathComponent
                 let ext = url.pathExtension.lowercased()
-                let parsed: (title: String, measures: [RawMeasure])
+                let parsed: (title: String, measures: [RawMeasure], meterNum: Int, meterDen: Int)
                 if ext == "mid" || ext == "midi" {
                     parsed = try MidiParser.parse(data, title: name)
                 } else {
@@ -1309,7 +1318,8 @@ struct ContentView: View {
                     }
                     parsed = try MusicXmlParser.parse(text, fallbackTitle: name)
                 }
-                model.loadPiece(parsed.measures, title: parsed.title)
+                model.loadPiece(parsed.measures, title: parsed.title,
+                                meterNum: parsed.meterNum, meterDen: parsed.meterDen)
                 importErr = ""
                 showImport = false
             } catch {
@@ -2382,7 +2392,7 @@ enum MidiParser {
         let len: Int
     }
 
-    static func parse(_ data: Data, title: String) throws -> (title: String, measures: [RawMeasure]) {
+    static func parse(_ data: Data, title: String) throws -> (title: String, measures: [RawMeasure], meterNum: Int, meterDen: Int) {
         let bytes = [UInt8](data)
         guard bytes.count >= 14 else { throw ScoreFileError.message("文件太小，不像是 MIDI") }
         guard bytes[0] == 0x4D, bytes[1] == 0x54, bytes[2] == 0x68, bytes[3] == 0x64 else {
@@ -2391,11 +2401,13 @@ enum MidiParser {
         let division = (Int(bytes[12]) << 8) | Int(bytes[13])
         guard division > 0 else { throw ScoreFileError.message("MIDI 时间基准无效") }
         let ppq = Double(division)
-        let barLength = 4.0
 
         var pos = 14
         var tracks: [[Ev]] = []
         var metaTitle = ""
+        var meterNum = 4
+        var meterDen = 4
+        var gotMeter = false
 
         while pos + 8 <= bytes.count {
             let isTrack = bytes[pos] == 0x4D && bytes[pos + 1] == 0x54 && bytes[pos + 2] == 0x72 && bytes[pos + 3] == 0x6B
@@ -2460,6 +2472,15 @@ enum MidiParser {
                     if type == 0x03 && q < stop {
                         let raw = Array(bytes[q..<stop])
                         if let t = String(bytes: raw, encoding: .utf8) { metaTitle = t }
+                    } else if type == 0x58 && q + 1 < stop && !gotMeter {
+                        // 拍号事件：第 1 字节是分子，第 2 字节是分母的 2 次幂
+                        let n = Int(bytes[q])
+                        let d = Int(bytes[q + 1])
+                        if n > 0 && n <= 32 && d <= 8 {
+                            meterNum = n
+                            meterDen = 1 << d
+                            gotMeter = true
+                        }
                     }
                     q = stop
                 } else if status == 0xF0 || status == 0xF7 {
@@ -2504,6 +2525,12 @@ enum MidiParser {
             }
         }
 
+        // 按曲谱实际拍号切小节；没读到拍号事件时按 4/4 处理
+        let barLength: Double = {
+            let v = Double(meterNum) * 4.0 / Double(meterDen)
+            return (v >= 0.5 && v <= 32) ? v : 4.0
+        }()
+
         func buildBars(_ list: [Ev], limit: Int) -> [[RawNote]] {
             var map: [Int: [RawNote]] = [:]
             for e in list {
@@ -2526,7 +2553,7 @@ enum MidiParser {
         let rhBars = buildBars(rhList, limit: 64)
         let lhBars = buildBars(lhList, limit: 64)
         let count = max(rhBars.count, lhBars.count)
-        guard count > 0 else { throw ScoreFileError.message("按 4/4 切分后没有任何小节") }
+        guard count > 0 else { throw ScoreFileError.message("按 \(meterNum)/\(meterDen) 切分后没有任何小节") }
 
         var out: [RawMeasure] = []
         for i in 0..<count {
@@ -2537,14 +2564,14 @@ enum MidiParser {
 
         var finalTitle = metaTitle.isEmpty ? title : metaTitle
         if count >= 64 { finalTitle += "（只取前 64 小节）" }
-        return (finalTitle, out)
+        return (finalTitle, out, meterNum, meterDen)
     }
 }
 
 enum MusicXmlParser {
     private static let stepValue: [Character: Int] = ["C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11]
 
-    static func parse(_ text: String, fallbackTitle: String) throws -> (title: String, measures: [RawMeasure]) {
+    static func parse(_ text: String, fallbackTitle: String) throws -> (title: String, measures: [RawMeasure], meterNum: Int, meterDen: Int) {
         guard text.contains("<score-partwise") || text.contains("<score-timewise") else {
             throw ScoreFileError.message("不是 MusicXML（缺少 score-partwise 根节点）")
         }
@@ -2566,6 +2593,8 @@ enum MusicXmlParser {
 
         var rhBars: [[RawNote]] = []
         var lhBars: [[RawNote]] = []
+        var xmlMeterNum = 4
+        var xmlMeterDen = 4
         let splitByStaff = parts.count == 1
 
         for (pi, part) in parts.enumerated() {
@@ -2576,6 +2605,16 @@ enum MusicXmlParser {
                   let b = part.range(of: "</measure>", range: a.upperBound..<part.endIndex) {
                 let body = String(part[a.upperBound..<b.lowerBound])
                 if let d = Double(innerText(body, "divisions") ?? ""), d > 0 { divisions = d }
+                if let bnum = Double(innerText(body, "beats") ?? ""),
+                   let btype = Double(innerText(body, "beat-type") ?? ""),
+                   bnum > 0, bnum <= 32, btype > 0, btype <= 64 {
+                    xmlMeterNum = Int(bnum)
+                    xmlMeterDen = Int(btype)
+                }
+                let measureLen: Double = {
+                    let v = Double(xmlMeterNum) * 4.0 / Double(xmlMeterDen)
+                    return (v >= 0.5 && v <= 32) ? v : 4.0
+                }()
 
                 var staffTime: [Int: Double] = [1: 0.0, 2: 0.0]
                 var lastPos: [Int: Double] = [:]
@@ -2605,9 +2644,10 @@ enum MusicXmlParser {
                         if let firstChar = step.first, let base = stepValue[firstChar] {
                             let midi = 12 * (octave + 1) + base + alter
                             if midi >= 21 && midi <= 108 {
-                                let note = RawNote(beat: min(3.75, pos),
+                                let cap = max(0.0, measureLen - 0.25)
+                                let note = RawNote(beat: min(cap, pos),
                                                    midis: [midi],
-                                                   dur: min(4.0, max(0.25, beats)))
+                                                   dur: min(measureLen, max(0.25, beats)))
                                 notesHere[staff, default: []].append(note)
                                 if !isChord { lastPos[staff] = pos }
                             }
@@ -2640,7 +2680,7 @@ enum MusicXmlParser {
         }
         var finalTitle = title
         if max(rhBars.count, lhBars.count) > 64 { finalTitle += "（只取前 64 小节）" }
-        return (finalTitle, out)
+        return (finalTitle, out, xmlMeterNum, xmlMeterDen)
     }
 
     private static func innerText(_ source: String, _ tag: String) -> String? {
