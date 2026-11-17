@@ -1,0 +1,55 @@
+name: PianoFollow
+options:
+  bundleIdPrefix: com.pianofollow
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_BITCODE: NO
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGNING_ALLOWED: NO
+
+targets:
+  PianoFollow:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pianofollow.app
+        PRODUCT_NAME: PianoFollow
+        TARGETED_DEVICE_FAMILY: "2"
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: 钢琴跟弹
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: true
+        UIViewControllerBasedStatusBarAppearance: false
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSBluetoothAlwaysUsageDescription: 连接蓝牙 MIDI 电钢琴需要此权限
+        NSBluetoothPeripheralUsageDescription: 连接蓝牙 MIDI 电钢琴需要此权限
+        NSMicrophoneUsageDescription: 声学钢琴用麦克风拾音需要此权限
+
+schemes:
+  PianoFollow:
+    build:
+      targets:
+        PianoFollow: all
+    run:
+      config: Debug
+    archive:
+      config: Release
